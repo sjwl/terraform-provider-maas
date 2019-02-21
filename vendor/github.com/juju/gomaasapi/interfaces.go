@@ -223,6 +223,9 @@ type Machine interface {
 	// specified. If there is no match, nil is returned.
 	Interface(id int) Interface
 
+	// CreateBondInterface will create a bond interface
+	CreateBondInterface(CreateBondInterfaceArgs) (Interface, error)
+
 	// PhysicalBlockDevices returns all the physical block devices on the machine.
 	PhysicalBlockDevices() []BlockDevice
 	// PhysicalBlockDevice returns the physical block device for the machine
@@ -327,6 +330,9 @@ type Interface interface {
 	// UnlinkSubnet will remove the Link to the subnet, and release the IP
 	// address associated if there is one.
 	UnlinkSubnet(Subnet) error
+
+	// Disconnect deletes any linked subnets and IP addresses, and disconnects the interface from any associated VLAN
+	Disconnect() error
 
 	// CreateVLANInterface will create a logical interface
 	CreateVLANInterface(CreateVLANInterfaceArgs) (Interface, error)

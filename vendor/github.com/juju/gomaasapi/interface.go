@@ -310,6 +310,31 @@ func (i *interface_) UnlinkSubnet(subnet Subnet) error {
 	return nil
 }
 
+// Disconnect
+func (i *interface_) Disconnect() error {
+	params := NewURLParams()
+	source, err := i.controller.post(i.resourceURI, "disconnect", params.Values)
+	if err != nil {
+		if svrErr, ok := errors.Cause(err).(ServerError); ok {
+			switch svrErr.StatusCode {
+			case http.StatusNotFound, http.StatusBadRequest:
+				return errors.Wrap(err, NewBadRequestError(svrErr.BodyMessage))
+			case http.StatusForbidden:
+				return errors.Wrap(err, NewPermissionError(svrErr.BodyMessage))
+			}
+		}
+		return NewUnexpectedError(err)
+	}
+
+	response, err := readInterface(i.controller.apiVersion, source)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	i.updateFrom(response)
+
+	return nil
+}
+
 // CreateVLANInterfaceArgs is an argument struct for passing parameters to
 // the Machine.CreateVLANInterface method.
 type CreateVLANInterfaceArgs struct {
@@ -338,7 +363,7 @@ func (i *interface_) interfacesURI() string {
 	return strings.Replace(i.resourceURI, "/"+strconv.Itoa(i.ID())+"/", "/", 1)
 }
 
-// CreateInterface implements Device.
+// CreateVLANInterface
 func (i *interface_) CreateVLANInterface(args CreateVLANInterfaceArgs) (Interface, error) {
 	if err := args.Validate(); err != nil {
 		return nil, errors.Trace(err)
@@ -371,8 +396,6 @@ func (i *interface_) CreateVLANInterface(args CreateVLANInterfaceArgs) (Interfac
 	}
 	iface.controller = i.controller
 
-	// TODO: add to the interfaces for the device when the interfaces are returned.
-	// lp:bug 1567213.
 	return iface, nil
 }
 
