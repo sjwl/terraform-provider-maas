@@ -103,10 +103,85 @@ func resourceMAASMachine() *schema.Resource {
 							ForceNew: true,
 						},
 						"type": {
-							Type:         schema.TypeString,
-							Optional:     true,
-							ForceNew:     true,
-							ValidateFunc: validation.StringInSlice([]string{"vlan", "physical", "bond"}, false),
+							Type:     schema.TypeString,
+							Required: true,
+							ForceNew: true,
+							ValidateFunc: validation.StringInSlice([]string{
+								"vlan",
+								"physical",
+								"bond",
+							}, false),
+						},
+						"bond": {
+							Type:     schema.TypeSet,
+							Optional: true,
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"parents": {
+										Type:     schema.TypeList,
+										Required: true,
+										Elem:     &schema.Schema{Type: schema.TypeString},
+									},
+									"mode": {
+										Type:     schema.TypeString,
+										Optional: true,
+										ValidateFunc: validation.StringInSlice([]string{
+											"balance-rr",
+											"active-backup",
+											"balance-xor",
+											"broadcast",
+											"802.3ad",
+											"balance-tlb",
+											"balance-alb",
+										}, false),
+										Default: "802.3ad",
+									},
+									"mii_mon": {
+										Type:     schema.TypeInt,
+										Optional: true,
+										Default:  100,
+									},
+									"down_delay": {
+										Type:         schema.TypeInt,
+										Optional:     true,
+										Default:      0,
+										ValidateFunc: validation.IntAtLeast(0),
+									},
+									"up_delay": {
+										Type:         schema.TypeInt,
+										Optional:     true,
+										Default:      0,
+										ValidateFunc: validation.IntAtLeast(0),
+									},
+									"lacp_rate": {
+										Type:     schema.TypeString,
+										Optional: true,
+										Default:  "slow",
+										ValidateFunc: validation.StringInSlice([]string{
+											"fast",
+											"slow",
+										}, false),
+									},
+									"xmit_hash_policy": {
+										Type:     schema.TypeString,
+										Optional: true,
+										Default:  "layer2",
+										ValidateFunc: validation.StringInSlice([]string{
+											"layer2",
+											"layer2+3",
+											"layer3+4",
+											"encap2+3",
+											"encap3+4",
+										}, false),
+									},
+									"num_grat_arp": {
+										Type:         schema.TypeInt,
+										Optional:     true,
+										Default:      1,
+										ValidateFunc: validation.IntAtLeast(0),
+									},
+								},
+							},
 						},
 						"fabric": {
 							Type:     schema.TypeString,
@@ -128,6 +203,7 @@ func resourceMAASMachine() *schema.Resource {
 							Type:         schema.TypeString,
 							Optional:     true,
 							ForceNew:     true,
+							Default:      "link_up",
 							ValidateFunc: validation.StringInSlice([]string{"auto", "static", "dhcp", "link_up"}, false),
 						},
 						"ip": {
@@ -412,124 +488,47 @@ func resourceMAASMachineCreate(d *schema.ResourceData, meta interface{}) error {
 	controller := meta.(*Config).controller
 	acquireParams := convertConstraints(d)
 
-	machine, _, err := controller.AllocateMachine(acquireParams)
+	var machine *gomaasapi.Machine
+	m, _, err := controller.AllocateMachine(acquireParams)
 	if err != nil {
 		log.Println("[ERROR] [resourceMAASMachineCreate] Unable to allocate machine.")
 		return err
 	}
+	machine = &m
 
 	// set the node id
-	d.SetId(machine.SystemID())
+	d.SetId((*machine).SystemID())
 
 	// save original hostname
-	d.Set("original_hostname", machine.Hostname())
+	d.Set("original_hostname", (*machine).Hostname())
 
 	// Update networking interfaces, if set
 	if v, ok := d.GetOk("deploy_interface"); ok {
-		subnets, err := getSubnets(controller)
-		if err != nil {
-			log.Println("[ERROR] [resourceMAASMachineCreate] Unable to get subnets")
-			if err := resourceMAASMachineDelete(d, meta); err != nil {
-				log.Printf("[DEBUG] Unable to release node: %s", err.Error())
-			}
-			return err
-		}
 
-		nicsMap := make(map[string]int, len(machine.InterfaceSet()))
-		for _, nic := range machine.InterfaceSet() {
-			nicsMap[nic.Name()] = nic.ID()
-		}
-		fabrics, err := controller.Fabrics()
-		if err != nil {
-			log.Println("[ERROR] [resourceMAASMachineCreate] Unable to get fabrics")
-			if err := resourceMAASMachineDelete(d, meta); err != nil {
-				log.Printf("[DEBUG] Unable to release node: %s", err.Error())
-			}
-			return err
-		}
-		fabricsMap := make(map[string]*gomaasapi.Fabric, len(fabrics))
-		for _, fabric := range fabrics {
-			fabricsMap[fabric.Name()] = &fabric
-		}
-		for _, interfaces_ := range v.(*schema.Set).List() {
-			i := interfaces_.(map[string]interface{})
+		// Need to loop through deploy_interface twice
+		// first to look for bond type interfaces and create them
+		// second loop link subnets, including bond interfaces that may have been created in the first loop
+		//   The reason we do this is because the vlan interfaces may belong to the bond interface that has yet to be created
 
-			// Find the matching interface
-			if nicID, ok := nicsMap[i["name"].(string)]; ok {
-
-				// Found the interface, now to configure it
-				nic := machine.Interface(nicID)
-
-				if fabricName, ok := i["fabric"].(string); ok && fabricName != "" {
-					fabric, ok := fabricsMap[fabricName]
-					if !ok {
-						if err := resourceMAASMachineDelete(d, meta); err != nil {
-							log.Printf("[DEBUG] Unable to release node: %s", err.Error())
-						}
-						return fmt.Errorf("[ERROR] [resourceMAASMachineCreate] fabric doesn't exist")
-					}
-					vlans := (*fabric).VLANs()
-					// create new interface if VLAN is set
-					vIndex := -1
-					if vlanNum, ok := i["vlan"].(int); ok && vlanNum != 0 {
-						for i, v := range vlans {
-							if v.VID() == vlanNum {
-								vIndex = i
-							}
-						}
-						if vIndex == -1 {
-							if err := resourceMAASMachineDelete(d, meta); err != nil {
-								log.Printf("[DEBUG] Unable to release node: %s", err.Error())
-							}
-							return fmt.Errorf("[ERROR] [resourceMAASMachineCreate] vlan doesn't exist")
-						}
-						// Check if this virtual interface already exists
-						if existingNIC, ok := nicsMap[i["name"].(string)+"."+strconv.Itoa(vlanNum)]; ok {
-							nic = machine.Interface(existingNIC)
-						} else {
-							nicVLAN, err := nic.CreateVLANInterface(gomaasapi.CreateVLANInterfaceArgs{
-								VLAN: vlans[vIndex],
-							})
-							if err != nil {
-								if err := resourceMAASMachineDelete(d, meta); err != nil {
-									log.Printf("[DEBUG] Unable to release node: %s", err.Error())
-								}
-								return err
-							}
-							nic = nicVLAN
-						}
-					} else {
-						if err := resourceMAASMachineDelete(d, meta); err != nil {
-							log.Printf("[DEBUG] Unable to release node: %s", err.Error())
-						}
-						return fmt.Errorf("[ERROR] [resourceMAASMachineCreate] if fabric is set so must vlan")
-					}
-				}
-
-				// Set subnet if set
-				if cidr, ok := i["subnet"].(string); ok && cidr != "" {
-					if subnet, ok := subnets[cidr]; ok {
-						err := nic.LinkSubnet(gomaasapi.LinkSubnetArgs{
-							Mode:      gomaasapi.LinkModeStatic,
-							Subnet:    subnet,
-							IPAddress: i["ip"].(string),
-						})
-						if err != nil {
-							log.Printf("[ERROR] [resourceMAASMachineCreate] Unable to link subnet ID=%d CIDR=%s to nicID=%d IP=%s", subnet.ID(), cidr, nic.ID(), i["ip"].(string))
-							if err := resourceMAASMachineDelete(d, meta); err != nil {
-								log.Printf("[DEBUG] Unable to release node: %s", err.Error())
-							}
-							return err
-						}
-					}
-				}
-
-				//
-			} else {
+		// Loop for bond interfaces
+		for _, nic := range v.(*schema.Set).List() {
+			if err := doNIC(d, meta, "bond", nic.(map[string]interface{}), &machine); err != nil {
+				log.Printf("[ERROR] Can't setup nic: %v", nic.(map[string]interface{}))
 				if err := resourceMAASMachineDelete(d, meta); err != nil {
 					log.Printf("[DEBUG] Unable to release node: %s", err.Error())
 				}
-				return fmt.Errorf("[ERROR] [resourceMAASMachineCreate] cannot find interface name: %s", i["name"].(string))
+				return err
+			}
+		}
+
+		// Loop for vlan and physical interfaces
+		for _, nic := range v.(*schema.Set).List() {
+			if err := doNIC(d, meta, "", nic.(map[string]interface{}), &machine); err != nil {
+				log.Printf("[ERROR] Can't setup nic: %v", nic.(map[string]interface{}))
+				if err := resourceMAASMachineDelete(d, meta); err != nil {
+					log.Printf("[DEBUG] Unable to release node: %s", err.Error())
+				}
+				return err
 			}
 		}
 	}
@@ -548,7 +547,7 @@ func resourceMAASMachineCreate(d *schema.ResourceData, meta interface{}) error {
 				log.Println("[DEBUG] Unable to update node")
 			}
 		}
-		if err := startMachine(d, meta, machine); err != nil {
+		if err := startMachine(d, meta, *machine); err != nil {
 			// unable to perform action, release the node
 			if err := resourceMAASMachineDelete(d, meta); err != nil {
 				log.Printf("[DEBUG] Unable to release node: %s", err.Error())
@@ -713,63 +712,48 @@ func resourceMAASMachineDelete(d *schema.ResourceData, meta interface{}) error {
 	}
 	//  proceed to restore config and finally release
 	//
-	//unlink any subnets
+
 	if v, ok := d.GetOk("deploy_interface"); ok {
-		subnets, err := getSubnets(controller)
+		//Disconnect or delete any interfaces
+		nicMap := make(map[string]gomaasapi.Interface, 0)
+		for _, nic := range machine.InterfaceSet() {
+			nicMap[nic.Name()] = nic
+		}
+		for _, netInterfaces := range v.(*schema.Set).List() {
+			i := netInterfaces.(map[string]interface{})
+
+			// if interface is physical, then we disconnect
+			// otherwise we delete the interface
+			if nic, ok := nicMap[i["name"].(string)]; ok && nic.Type() == "physical" {
+				if err := nic.Disconnect(); err != nil {
+					log.Println("[ERROR] [resourceMAASMachineDelete] Unable to disconnect interface %s", nic.Name())
+					return err
+				}
+			} else {
+				// don't care if we can delete it or not, since it's possible a bond interface was deleted earlier in the loop
+				// which would automatically delete any children interfaces and thus cause subsequent delete attempts to fail later in the loop
+				nic.Disconnect()
+				nic.Delete()
+			}
+		}
+	}
+
+	// remove deploy hostname if set
+	if _, ok := d.GetOk("deploy_hostname"); ok {
+		params := url.Values{}
+		params.Set("hostname", d.Get("original_hostname").(string))
+		err := nodeUpdate(meta.(*Config).MAASObject, d.Id(), params)
 		if err != nil {
-			log.Println("[WARN] [resourceMAASMachineDelete] Unable to get subnets.")
-		} else {
-			nicMap := make(map[string]gomaasapi.Interface, 0)
-			for _, nic := range machine.InterfaceSet() {
-				nicMap[nic.Name()] = nic
-			}
-			for _, netInterfaces := range v.(*schema.Set).List() {
-				i := netInterfaces.(map[string]interface{})
-
-				// if vlan is specified, then we delete interface
-				// otherwise we unlink subnet
-				if vlanNum, ok := i["vlan"].(int); ok && vlanNum != 0 {
-					if nic, ok := nicMap[i["name"].(string)+"."+strconv.Itoa(vlanNum)]; ok {
-						err := nic.Delete()
-						if err != nil {
-							log.Printf("[ERROR] [resourceMAASMachineDelete] Unable to delete interface %s", nic.Name())
-							return err
-						}
-					} else {
-						log.Printf("[WARN] expected nic (%s) not found", i["name"].(string)+"."+strconv.Itoa(vlanNum))
-					}
-				} else if cidr, ok := i["subnet"].(string); ok && cidr != "" {
-					if subnet, ok := subnets[cidr]; ok {
-						if nic, ok := nicMap[i["name"].(string)]; ok {
-							err := nic.UnlinkSubnet(subnet)
-							if err != nil {
-								log.Println("[ERROR] [resourceMAASMachineDelete] Unable to unlink subnet.")
-								return err
-							}
-						} else {
-							log.Printf("[WARN] attempting to unlink subnet for expected nic (%s) not found", i["name"].(string)+"."+strconv.Itoa(vlanNum))
-						}
-					}
-				}
-			}
+			log.Println("[DEBUG] Unable to reset hostname: %s", err)
 		}
-		// remove deploy hostname if set
-		if _, ok := d.GetOk("deploy_hostname"); ok {
-			params := url.Values{}
-			params.Set("hostname", d.Get("original_hostname").(string))
-			err := nodeUpdate(meta.(*Config).MAASObject, d.Id(), params)
+	}
+
+	// remove deployed tags
+	if tags, ok := d.GetOk("deploy_tags"); ok {
+		for i := range tags.([]interface{}) {
+			err := nodeTagsRemove(meta.(*Config).MAASObject, d.Id(), tags.([]interface{})[i].(string))
 			if err != nil {
-				log.Println("[DEBUG] Unable to reset hostname: %s", err)
-			}
-		}
-
-		// remove deployed tags
-		if tags, ok := d.GetOk("deploy_tags"); ok {
-			for i := range tags.([]interface{}) {
-				err := nodeTagsRemove(meta.(*Config).MAASObject, d.Id(), tags.([]interface{})[i].(string))
-				if err != nil {
-					log.Printf("[ERROR] Unable to update node (%s) with tag (%s)", d.Id(), tags.([]interface{})[i].(string))
-				}
+				log.Printf("[ERROR] Unable to update node (%s) with tag (%s)", d.Id(), tags.([]interface{})[i].(string))
 			}
 		}
 	}
@@ -845,9 +829,9 @@ func convertConstraints(d *schema.ResourceData) gomaasapi.AllocateMachineArgs {
 	return args
 }
 
-func getSubnets(controller gomaasapi.Controller) (map[string]gomaasapi.Subnet, error) {
+func getSubnets(controller *gomaasapi.Controller) (map[string]gomaasapi.Subnet, error) {
 	// Get all the spaces
-	spaces, err := controller.Spaces()
+	spaces, err := (*controller).Spaces()
 	if err != nil {
 		return nil, err
 	}
@@ -857,7 +841,7 @@ func getSubnets(controller gomaasapi.Controller) (map[string]gomaasapi.Subnet, e
 	for _, space := range spaces {
 		for _, subnet := range space.Subnets() {
 			log.Printf("[DEBUG] spaceID=%d, spaceName=%s, subnetID=%d, subnetName=%s", space.ID(), space.Name(), subnet.ID(), subnet.Name())
-			subnets[subnet.Name()] = subnet
+			subnets[subnet.CIDR()] = subnet
 		}
 	}
 
@@ -925,4 +909,246 @@ func startMachine(d *schema.ResourceData, meta interface{}, machine gomaasapi.Ma
 		return fmt.Errorf("[ERROR] [resourceMAASMachineUpdate] Error waiting for machine (%s) to become deployed: %s", d.Id(), err)
 	}
 	return nil
+}
+
+func readMachine(d *schema.ResourceData, meta interface{}) (*gomaasapi.Machine, error) {
+
+	controller := meta.(*Config).controller
+	var ids []string
+
+	machines, err := controller.Machines(gomaasapi.MachinesArgs{
+		SystemIDs: append(ids, d.Id()),
+	})
+	if err != nil {
+		log.Printf("[ERROR] [resourceMAASMachineCreate] cannnot list machines")
+		if err := resourceMAASMachineDelete(d, meta); err != nil {
+			log.Printf("[DEBUG] Unable to release node: %s", err.Error())
+		}
+		return nil, err
+	}
+	if len(machines) != 1 {
+		if err := resourceMAASMachineDelete(d, meta); err != nil {
+			log.Printf("[DEBUG] Unable to release node: %s", err.Error())
+		}
+		return nil, fmt.Errorf("[ERROR] [resourceMAASMachineCreate] machine ID(%s) is not unique", machines[0].SystemID())
+	}
+	// refresh since we just created a bond
+
+	return &machines[0], nil
+}
+
+func doNIC(d *schema.ResourceData, meta interface{}, nicWant string, i map[string]interface{}, machine **gomaasapi.Machine) error {
+
+	nicType := "vlan"
+	if t, ok := i["type"].(string); ok {
+		nicType = t
+	}
+
+	// if the type doesn't match nicType then exit normally
+	if (nicWant == "bond" && nicType != "bond") || (nicWant != "bond" && nicType == "bond") {
+		return nil
+	}
+
+	controller := meta.(*Config).controller
+
+	nicsMap := make(map[string]int, len((**machine).InterfaceSet()))
+	for _, nic := range (**machine).InterfaceSet() {
+		nicsMap[nic.Name()] = nic.ID()
+	}
+	fabrics, err := controller.Fabrics()
+	if err != nil {
+		log.Println("[ERROR] Unable to get fabrics")
+		if err := resourceMAASMachineDelete(d, meta); err != nil {
+			log.Printf("[DEBUG] Unable to release node: %s", err.Error())
+		}
+		return err
+	}
+	fabricsMap := make(map[string]*gomaasapi.Fabric, len(fabrics))
+	for _, fabric := range fabrics {
+		fabricsMap[fabric.Name()] = &fabric
+	}
+
+	subnets, err := getSubnets(&controller)
+
+	// Create bond interface if necessary
+	if b, ok := i["bond"]; ok && nicType == "bond" && len(b.(*schema.Set).List()) > 0 {
+		if _, bondAlreadyExists := nicsMap[i["name"].(string)]; !bondAlreadyExists {
+			bondParams := b.(*schema.Set).List()[0].(map[string]interface{})
+			parentNics, ok := bondParams["parents"].([]interface{})
+			if !ok || parentNics == nil || len(parentNics) == 0 {
+				if err := resourceMAASMachineDelete(d, meta); err != nil {
+					log.Printf("[DEBUG] Unable to release node: %s", err.Error())
+				}
+				return fmt.Errorf("[ERROR] bond parents missing")
+			}
+			var parentIDs []int
+			for _, p := range parentNics {
+				if pID, ok := nicsMap[p.(string)]; ok && pID > 0 {
+					parentIDs = append(parentIDs, pID)
+				} else {
+					if err := resourceMAASMachineDelete(d, meta); err != nil {
+						log.Printf("[DEBUG] Unable to release node: %s", err.Error())
+					}
+					return fmt.Errorf("[ERROR] non existing parent interface: %s", p)
+				}
+			}
+			nic, err := (**machine).CreateBondInterface(gomaasapi.CreateBondInterfaceArgs{
+				Name:    i["name"].(string),
+				Parents: parentIDs,
+			})
+			if err != nil {
+				log.Printf("[ERROR] Unable to create bond")
+				if err := resourceMAASMachineDelete(d, meta); err != nil {
+					log.Printf("[DEBUG] Unable to release node: %s", err.Error())
+				}
+				return err
+			}
+
+			// refresh machine to relect the newly created interface
+			if *machine, err = readMachine(d, meta); err != nil {
+				log.Printf("[ERROR] Unable to read machine %d", d.Id())
+				if err := resourceMAASMachineDelete(d, meta); err != nil {
+					log.Printf("[ERROR] Unable to release node: %s", err.Error())
+				}
+				return err
+			}
+
+			nicsMap[i["name"].(string)] = nic.ID()
+		}
+	}
+
+	// Find the matching interface
+	if nicID, ok := nicsMap[i["name"].(string)]; ok && nicID > 0 {
+
+		// Found the interface, now to configure it
+		nic := (**machine).Interface(nicID)
+
+		if fabricName, ok := i["fabric"].(string); ok && fabricName != "" {
+			fabric, ok := fabricsMap[fabricName]
+			if !ok {
+				if err := resourceMAASMachineDelete(d, meta); err != nil {
+					log.Printf("[DEBUG] Unable to release node: %s", err.Error())
+				}
+				return fmt.Errorf("[ERROR] fabric doesn't exist")
+			}
+			// We connect the fabric to this interface by associating the untagged vlan (vid = 0)
+			vid := 0
+			if v, ok := i["vlan"].(int); ok {
+				if t, ok := i["type"].(string); ok && t == "physical" {
+					vid = v
+				}
+			}
+			vlans := (*fabric).VLANs()
+			for _, v := range vlans {
+				if v.VID() == vid {
+					if err := nic.Update(gomaasapi.UpdateInterfaceArgs{
+						VLAN: v,
+					}); err != nil {
+						log.Printf("[ERROR] Cannot update nic %s", nic.Name())
+						if err := resourceMAASMachineDelete(d, meta); err != nil {
+							log.Printf("[DEBUG] Unable to release node: %s", err.Error())
+						}
+						return err
+					}
+				}
+			}
+			// figure out the VLAN to configure
+
+			// default to untagged (vid=0) vlan
+			vIndex := -1
+			for i, v := range vlans {
+				if v.VID() == 0 {
+					vIndex = i
+					break
+				}
+			}
+
+			if vlanNum, ok := i["vlan"].(int); ok && nicType == "vlan" {
+				vlanExists := false
+				for i, v := range vlans {
+					if v.VID() == vlanNum {
+						vlanExists = true
+						vIndex = i
+						break
+					}
+				}
+				if !vlanExists {
+					if err := resourceMAASMachineDelete(d, meta); err != nil {
+						log.Printf("[DEBUG] Unable to release node: %s", err.Error())
+					}
+					return fmt.Errorf("[ERROR] vlan doesn't exist")
+				}
+			}
+
+			// If interface is a vlan interface then obtain a pointer to its Interface object, create if necessary
+			nicName := i["name"].(string)
+			if nicType == "vlan" {
+				nicName = nicName + "." + strconv.Itoa(vlans[vIndex].VID())
+				if existingNIC, ok := nicsMap[nicName]; ok {
+					log.Printf("[DEBUG] VLAN interface (%s) already exists, no need to create", nicName)
+					nic = (**machine).Interface(existingNIC)
+				} else {
+					log.Printf("[DEBUG] Creating VLAN interface with vid=%d", vlans[vIndex].VID())
+					nicVLAN, err := nic.CreateVLANInterface(gomaasapi.CreateVLANInterfaceArgs{
+						VLAN: vlans[vIndex],
+					})
+
+					if err != nil {
+						log.Printf("[ERROR] Failed creating VLAN interface with vid=%d", vlans[vIndex].VID())
+						if err := resourceMAASMachineDelete(d, meta); err != nil {
+							log.Printf("[DEBUG] Unable to release node: %s", err.Error())
+						}
+						return err
+					}
+					nic = nicVLAN
+				}
+			}
+
+			// Set subnet if set
+			if cidr, ok := i["subnet"].(string); ok && cidr != "" {
+				if subnet, ok := subnets[cidr]; ok {
+					log.Printf("[INFO] link subnet ID=%d CIDR=%s to nicID=%d IP=%s", subnet.ID(), cidr, nic.ID(), i["ip"].(string))
+
+					err := nic.LinkSubnet(gomaasapi.LinkSubnetArgs{
+						Mode:      getIPMode(i["ip_mode"].(string)),
+						Subnet:    subnet,
+						IPAddress: i["ip"].(string),
+					})
+					if err != nil {
+						log.Printf("[ERROR]  Unable to link subnet ID=%d CIDR=%s to nicID=%d IP=%s", subnet.ID(), cidr, nic.ID(), i["ip"].(string))
+						if err := resourceMAASMachineDelete(d, meta); err != nil {
+							log.Printf("[DEBUG] Unable to release node: %s", err.Error())
+						}
+						return err
+					}
+				} else {
+					if err := resourceMAASMachineDelete(d, meta); err != nil {
+						log.Printf("[DEBUG] Unable to release node: %s", err.Error())
+					}
+					return fmt.Errorf("[ERROR] subnet (%s) does not exist", cidr)
+				}
+			}
+		}
+
+	} else {
+		if err := resourceMAASMachineDelete(d, meta); err != nil {
+			log.Printf("[DEBUG] Unable to release node: %s", err.Error())
+		}
+		return fmt.Errorf("[ERROR] [resourceMAASMachineCreate] cannot find interface name: %s in map: %v", i["name"].(string), nicsMap)
+	}
+	return nil
+}
+
+func getIPMode(s string) (ipMode gomaasapi.InterfaceLinkMode) {
+
+	switch s {
+	case "static", "auto":
+		ipMode = gomaasapi.LinkModeStatic
+	case "dhcp":
+		ipMode = gomaasapi.LinkModeDHCP
+	default:
+		ipMode = gomaasapi.LinkModeLinkUp
+	}
+
+	return ipMode
 }

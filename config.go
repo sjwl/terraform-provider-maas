@@ -120,7 +120,7 @@ func toNodeInfo(nodeObject *gomaasapi.MAASObject) (*NodeInfo, error) {
 		return nil, err
 	}
 
-	log.Printf("[DEBUG] [toNodeInfo] Node (%s) JSON:\n%s\n", system_id, prettyJSON)
+	//	log.Printf("[DEBUG] [toNodeInfo] Node (%s) JSON:\n%s\n", system_id, prettyJSON)
 
 	var raw_data map[string]interface{}
 	if err := json.Unmarshal(prettyJSON, &raw_data); err != nil {

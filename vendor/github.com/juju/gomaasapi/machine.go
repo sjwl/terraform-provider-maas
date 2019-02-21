@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/juju/errors"
 	"github.com/juju/schema"
@@ -140,6 +141,107 @@ func (m *machine) Interface(id int) Interface {
 		}
 	}
 	return nil
+}
+
+// CreateBondInterfaceArgs is an argument struct for passing parameters to
+// the Machine.CreateBondInterface method.
+type CreateBondInterfaceArgs struct {
+	// Name of the interface (required).
+	Name string
+	// Parents - parent interface ids that make this bond
+	Parents []int
+	// MACAddress is the MAC address of the interface (required).
+	MACAddress string
+	// VLAN is the untagged VLAN the interface is connected to (required).
+	VLAN VLAN
+	// Tags to attach to the interface (optional).
+	Tags []string
+	// MTU - Maximum transmission unit. (optional)
+	MTU int
+	// AcceptRA - Accept router advertisements. (IPv6 only)
+	AcceptRA bool
+	// Autoconf - Perform stateless autoconfiguration. (IPv6 only)
+	Autoconf bool
+	// BondMode - balance-rr, active-backup, balance-xor, broadcast, 802.3ad, balance-tlb, balance-alb
+	BondMode string
+	// BondMiiMon - The link monitoring frequency in ms (default 100)
+	BondMiiMon int
+	// BondDownDelay - Specifies the time, in ms, to wait before disabling a slave after a link failure has been detected
+	BondDownDelay int
+	// BondUpDelay - Specifies the time, in ms, to wait before enabling a slave after a link recovery has been detected
+	BondUpDelay int
+	// BondLacpRate - Option specifying the rate at which to ask the link partner to transmit LACPDU packets in 802.3ad mode.  Available options are "fast" or "slow" (Default "slow")
+	BondLacpRate string
+	// BondXmitHashPolicy - The transmit hash policy to use for slave selection in balance-xor, 802.3ad, and tlb modes.
+	//                      Possible values - layer2, layer2+3, layer3+4, encap2+3, encap3+4 (Default layer2)
+	BondXmitHashPolicy string
+	// BondNumGratArp - The number of peer notifications (IPv4 ARP or IPv6 Neighbour Advertisements) to be issued after a failover (Default 1)
+	BondNumGratArp int
+}
+
+// Validate checks the required fields are set for the arg structure.
+func (a *CreateBondInterfaceArgs) Validate() error {
+	if a.Name == "" {
+		return errors.NotValidf("missing bond name")
+	}
+	if len(a.Parents) == 0 {
+		return errors.NotValidf("missing bond parents interfaces")
+	}
+	return nil
+}
+
+// machinesURI used to add child interfaces to this machine.
+func (m *machine) machinesURI() string {
+	return strings.Replace(m.resourceURI, "/machines/", "/nodes/", 1) + "interfaces/"
+}
+
+// CreateBondInterface
+func (m *machine) CreateBondInterface(args CreateBondInterfaceArgs) (Interface, error) {
+	if err := args.Validate(); err != nil {
+		return nil, errors.Trace(err)
+	}
+	params := NewURLParams()
+	params.Values.Add("name", args.Name)
+	for _, v := range args.Parents {
+		params.Values.Add("parents", fmt.Sprint(v))
+	}
+	params.MaybeAdd("mac_address", args.MACAddress)
+	if args.VLAN != nil {
+		params.MaybeAddInt("vlan", args.VLAN.ID())
+	}
+	params.MaybeAdd("tags", strings.Join(args.Tags, ","))
+	params.MaybeAddInt("mtu", args.MTU)
+	params.MaybeAddBool("accept_ra", args.AcceptRA)
+	params.MaybeAddBool("autoconf", args.Autoconf)
+	params.MaybeAdd("bond_mode", args.BondMode)
+	params.MaybeAddInt("bond_miimon", args.BondMiiMon)
+	params.MaybeAddInt("bond_downdelay", args.BondDownDelay)
+	params.MaybeAddInt("bond_updelay", args.BondUpDelay)
+	params.MaybeAdd("bond_lacp_rate", args.BondLacpRate)
+	params.MaybeAdd("bond_xmit_hash_policy", args.BondXmitHashPolicy)
+	params.MaybeAddInt("bond_num_grat_arp", args.BondNumGratArp)
+	result, err := m.controller.post(m.machinesURI(), "create_bond", params.Values)
+	if err != nil {
+		if svrErr, ok := errors.Cause(err).(ServerError); ok {
+			switch svrErr.StatusCode {
+			case http.StatusNotFound, http.StatusConflict:
+				return nil, errors.Wrap(err, NewBadRequestError(svrErr.BodyMessage))
+			case http.StatusForbidden:
+				return nil, errors.Wrap(err, NewPermissionError(svrErr.BodyMessage))
+			case http.StatusServiceUnavailable:
+				return nil, errors.Wrap(err, NewCannotCompleteError(svrErr.BodyMessage))
+			}
+		}
+		return nil, NewUnexpectedError(err)
+	}
+
+	iface, err := readInterface(m.controller.apiVersion, result)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	iface.controller = m.controller
+
+	return iface, nil
 }
 
 // OperatingSystem implements Machine.

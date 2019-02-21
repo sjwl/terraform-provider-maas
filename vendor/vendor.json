@@ -849,10 +849,10 @@
 			"revisionTime": "2019-02-07T03:37:35Z"
 		},
 		{
-			"checksumSHA1": "YKjSOrmxLzHRqkxzHb8r/Bi+vq0=",
+			"checksumSHA1": "/q8aPSOcGqRLiJ4UFw0Lbiaoz6s=",
 			"path": "github.com/juju/gomaasapi",
-			"revision": "fbf18576d2f6f572656ef778f99e8b28faf8f72e",
-			"revisionTime": "2019-02-12T19:48:05Z"
+			"revision": "32a347ec971f47145d0ee3e9754f64c8dbf1456f",
+			"revisionTime": "2019-02-21T22:24:30Z"
 		},
 		{
 			"checksumSHA1": "xfvw14hTUal9IGkih9Sh+g+YDu4=",
